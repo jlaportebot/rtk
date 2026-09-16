@@ -280,84 +280,77 @@ pub fn run(
 
     let sessions = provider.discover_sessions(project_filter.as_deref(), Some(since_days))?;
 
-        if verbose > 0 {
-            eprintln!("Scanning {} session files...", sessions.len());
-            for s in &sessions {
-                eprintln!("  {}", s.display());
-            }
+    if verbose > 0 {
+        eprintln!("Scanning {} session files...", sessions.len());
+        for s in &sessions {
+            eprintln!("  {}", s.display());
         }
+    }
 
-        // Transcripts record commands as the model emitted them, before the PreToolUse
-        // hook rewrites them. Prefer ground truth from the `hook_decisions` log (keyed by
-        // `tool_use_id`, populated at the moment the hook actually ran) over guessing from
-        // today's hook-install state; fall back to a heuristic only for history that
-        // predates logging (or isn't Claude Code).
-        let hook_installed = hook_status() != HookStatus::Missing;
-        let (excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
-        // Compiled once here (see `CoverageContext`'s doc comment), not once per
-        // command inside `registry::rewrite_command`.
-        let exclude_patterns = registry::compile_exclude_patterns(&excluded);
-        let normalized_transparent_prefixes =
-            registry::normalize_transparent_prefixes(&transparent_prefixes);
+    // Transcripts record commands as the model emitted them, before the PreToolUse
+    // hook rewrites them. Prefer ground truth from the `hook_decisions` log (keyed by
+    // `tool_use_id`, populated at the moment the hook actually ran) over guessing from
+    // today's hook-install state; fall back to a heuristic only for history that
+    // predates logging (or isn't Claude Code).
+    let hook_installed = hook_status() != HookStatus::Missing;
+    let (excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
+    // Compiled once here (see `CoverageContext`'s doc comment), not once per
+    // command inside `registry::rewrite_command`.
+    let exclude_patterns = registry::compile_exclude_patterns(&excluded);
+    let normalized_transparent_prefixes =
+        registry::normalize_transparent_prefixes(&transparent_prefixes);
 
-        // Loaded once up front (see `PermissionRules`), not once per command.
-        let (deny, ask, allow) = permissions::load_rules_for(permissions::Host::Claude);
-        let rules = PermissionRules { deny, ask, allow };
+    // Loaded once up front (see `PermissionRules`), not once per command.
+    let (deny, ask, allow) = permissions::load_rules_for(permissions::Host::Claude);
+    let rules = PermissionRules { deny, ask, allow };
 
-        let cutoff = crate::core::utils::days_ago_cutoff(since_days);
-        // Every other hook_decisions-touching path (record()/record_parse_failure()/
-        // record_hook_decision() in tracking.rs) warns the user when a write fails
-        // because a table is missing, pointing them at `rtk init` to self-heal. This
-        // read path used to swallow the same class of error via unwrap_or_default()/
-        // ok().flatten(), silently reporting "no hook-decision log yet" for what could
-        // actually be a corrupted database — warn here too instead of going quiet.
-        let (hook_log, measured_since): (HashMap<String, HookDecisionRecord>, Option<DateTime<Utc>>) =
-            match Tracker::new() {
-                Ok(t) => {
-                    let log = t.hook_decisions_since(cutoff).unwrap_or_else(|e| {
-                        eprintln!(
-                            "rtk: warning: failed to read hook_decisions log ({e}). \\
-                             Coverage will fall back to the current-state estimate. \\
-                             Run `rtk init` if the tracking database looks corrupted."
-                        );
-                        HashMap::new()
-                    });
-                    let measured_since = t.earliest_hook_decision_timestamp().unwrap_or_else(|e| {
-                        eprintln!("rtk: warning: failed to read hook_decisions log timestamp ({e}).");
-                        None
-                    });
-                    (log, measured_since)
+    let cutoff = crate::core::utils::days_ago_cutoff(since_days);
+    // Every other hook_decisions-touching path (record()/record_parse_failure()/
+    // record_hook_decision() in tracking.rs) warns the user when a write fails
+    // because a table is missing, pointing them at `rtk init` to self-heal. This
+    // read path used to swallow the same class of error via unwrap_or_default()/
+    // ok().flatten(), silently reporting "no hook-decision log yet" for what could
+    // actually be a corrupted database — warn here too instead of going quiet.
+    let (hook_log, measured_since): (HashMap<String, HookDecisionRecord>, Option<DateTime<Utc>>) =
+        match Tracker::new() {
+            Ok(t) => {
+                let log = t.hook_decisions_since(cutoff).unwrap_or_else(|e| {
+                    eprintln!(
+                        "rtk: warning: failed to read hook_decisions log ({e}). \
+                         Coverage will fall back to the current-state estimate. \
+                         Run `rtk init` if the tracking database looks corrupted."
+                    );
+                    HashMap::new()
+                });
+                let measured_since = t.earliest_hook_decision_timestamp().unwrap_or_else(|e| {
+                    eprintln!("rtk: warning: failed to read hook_decisions log timestamp ({e}).");
+                    None
+                });
+                (log, measured_since)
+            }
+            Err(e) => {
+                // A brand-new install with no tracking DB yet is the common,
+                // benign case here — only surface this under --verbose so a fresh
+                // `rtk discover` run doesn't alarm a first-time user.
+                if verbose > 0 {
+                    eprintln!(
+                        "rtk: warning: failed to open tracking database ({e}). \
+                         Coverage will fall back to the current-state estimate."
+                    );
                 }
-                Err(e) => {
-                    // A brand-new install with no tracking DB yet is the common,
-                    // benign case here — only surface this under --verbose so a fresh
-                    // `rtk discover` run doesn't alarm a first-time user.
-                    if verbose > 0 {
-                        eprintln!(
-                            "rtk: warning: failed to open tracking database ({e}). \\
-                             Coverage will fall back to the current-state estimate."
-                        );
-                    }
-                    (HashMap::new(), None)
-                }
-            };
-
-        let coverage_ctx = CoverageContext {
-            hook_log,
-            hook_installed,
-            rules,
-            exclude_patterns,
-            normalized_transparent_prefixes,
+                (HashMap::new(), None)
+            }
         };
 
-        // On Windows, if no sessions found, provide helpful info about session location
-        if cfg!(target_os = "windows") && sessions.is_empty() {
-            eprintln!(
-                "\n[rtk] Note: On Windows, Claude Code sessions are stored in:\n  %USERPROFILE%\\.claude\\projects\\\nIf this directory doesn't exist, Claude Code may not have been run yet,\nor sessions may be in a different location."
-            );
-        }
+    let coverage_ctx = CoverageContext {
+        hook_log,
+        hook_installed,
+        rules,
+        exclude_patterns,
+        normalized_transparent_prefixes,
+    };
 
-        let mut total_commands: usize = 0;
+    let mut total_commands: usize = 0;
     let mut already_rtk: usize = 0;
     let mut already_rtk_estimated: usize = 0;
     let mut parse_errors: usize = 0;
